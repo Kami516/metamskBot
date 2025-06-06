@@ -1,7 +1,8 @@
+// app/api/monitor/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 
-const TELEGRAM_BOT_TOKEN = '7402137544:AAFr0c7ziqCrkipM1tUG_BOR5oFMQYSOdJE';
-const GROUP_CHAT_ID = '-1002605199066';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
+const GROUP_CHAT_ID = process.env.TELEGRAM_GROUP_CHAT_ID!;
 const CONFIG_URL = 'https://raw.githubusercontent.com/MetaMask/eth-phishing-detect/refs/heads/main/src/config.json';
 const METAMASK_URL = 'https://raw.githubusercontent.com/MetaMask/eth-phishing-detect/refs/heads/main/src/config.json';
 
@@ -16,6 +17,7 @@ interface PhishingConfig {
 let lastKnownLinks: string[] = [];
 let isInitialized = false;
 let monitorInterval: NodeJS.Timeout | null = null;
+let isProduction = process.env.NODE_ENV === 'production';
 
 async function fetchPhishingConfig(): Promise<PhishingConfig> {
   const response = await fetch(CONFIG_URL, { 
@@ -51,10 +53,12 @@ async function checkForNewLinks(): Promise<void> {
     if (!isInitialized) {
       lastKnownLinks = currentLinks;
       isInitialized = true;
-      console.log(`✅ Monitor initialized with ${currentLinks.length} links`);
+      const mode = isProduction ? 'PRODUCTION' : 'DEVELOPMENT';
+      console.log(`✅ Monitor initialized in ${mode} mode with ${currentLinks.length} links`);
       
       // Send startup message
       const startupMessage = `🤖 <b>Phishing Monitor Started!</b>\n\n` +
+                           `🌍 Mode: <b>${mode}</b>\n` +
                            `📊 Monitoring ${currentLinks.length} known phishing links\n` +
                            `⏰ Checking every minute for new threats\n` +
                            `🔗 Source: <a href="${METAMASK_URL}">MetaMask Config</a>`;
@@ -91,7 +95,8 @@ function startMonitoring(): void {
     return;
   }
 
-  console.log('🚀 Starting phishing monitor...');
+  const mode = isProduction ? 'PRODUCTION' : 'DEVELOPMENT';
+  console.log(`🚀 Starting phishing monitor in ${mode} mode...`);
   
   // Initial check
   checkForNewLinks();
@@ -104,12 +109,26 @@ function startMonitoring(): void {
   console.log('✅ Monitor started - checking every minute');
 }
 
-// Auto-start monitoring when the module loads
+// Auto-start monitoring when the module loads (both dev and production)
 startMonitoring();
+
+// Production auto-trigger: Make initial request to ensure monitoring starts
+if (isProduction) {
+  // Wait a bit for the server to fully start, then trigger the endpoint
+  setTimeout(async () => {
+    try {
+      const response = await fetch(`${process.env.VERCEL_URL || 'http://localhost:3000'}/api/monitor`);
+      console.log('🎯 Production auto-trigger executed');
+    } catch (error) {
+      console.log('📡 Production auto-trigger attempted (URL resolution may vary by platform)');
+    }
+  }, 5000);
+}
 
 export async function GET(request: NextRequest) {
   return NextResponse.json({ 
     status: 'running',
+    mode: isProduction ? 'production' : 'development',
     timestamp: new Date().toISOString(),
     totalLinks: lastKnownLinks.length,
     initialized: isInitialized,
