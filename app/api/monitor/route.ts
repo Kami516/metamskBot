@@ -14,6 +14,11 @@ interface PhishingConfig {
   whitelist: string[];
 }
 
+interface ChainAbuseResult {
+  totalReports: number;
+  found: boolean;
+}
+
 let lastKnownLinks: string[] = [];
 let isInitialized = false;
 let monitorInterval: NodeJS.Timeout | null = null;
@@ -29,20 +34,96 @@ async function fetchPhishingConfig(): Promise<PhishingConfig> {
   return response.json();
 }
 
+async function checkChainAbuseReports(domain: string): Promise<ChainAbuseResult> {
+  try {
+    // Ensure domain has protocol
+    const fullUrl = domain.startsWith('http') ? domain : `https://${domain}`;
+    const encodedUrl = encodeURIComponent(fullUrl);
+    const chainAbuseUrl = `https://www.chainabuse.com/domain/${encodedUrl}`;
+    
+    console.log(`🔍 Checking ChainAbuse for: ${domain}`);
+    
+    const response = await fetch(chainAbuseUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+      },
+      cache: 'no-store',
+      signal: AbortSignal.timeout(10000) // 10 second timeout
+    });
+
+    if (!response.ok) {
+      console.log(`❌ ChainAbuse request failed for ${domain}: ${response.status}`);
+      return { totalReports: 0, found: false };
+    }
+
+    const html = await response.text();
+    
+    // Look for the pattern "X Scam Reports" in the HTML
+    const reportMatch = html.match(/(\d+)\s+Scam\s+Reports?/i);
+    
+    if (reportMatch) {
+      const reportCount = parseInt(reportMatch[1], 10);
+      console.log(`✅ Found ${reportCount} reports for ${domain}`);
+      return { totalReports: reportCount, found: true };
+    }
+
+    // Alternative patterns to look for
+    const altPatterns = [
+      /Reports\s+submitted\s+for[^>]*>([^<]*)</i,
+      /(\d+)\s+reports?\s+found/i,
+      /Total\s+reports?:\s*(\d+)/i
+    ];
+
+    for (const pattern of altPatterns) {
+      const match = html.match(pattern);
+      if (match) {
+        const reportCount = parseInt(match[1], 10);
+        if (!isNaN(reportCount)) {
+          console.log(`✅ Found ${reportCount} reports for ${domain} (alt pattern)`);
+          return { totalReports: reportCount, found: true };
+        }
+      }
+    }
+
+    // Check if the page exists but has no reports
+    if (html.includes('chainabuse') && html.includes(domain.replace(/https?:\/\//, ''))) {
+      console.log(`📋 Domain ${domain} found on ChainAbuse but no reports detected`);
+      return { totalReports: 0, found: true };
+    }
+
+    console.log(`❓ No reports found for ${domain}`);
+    return { totalReports: 0, found: false };
+
+  } catch (error) {
+    console.error(`❌ Error checking ChainAbuse for ${domain}:`, error);
+    return { totalReports: 0, found: false };
+  }
+}
+
 async function sendTelegramMessage(message: string): Promise<void> {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  
-  await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      chat_id: GROUP_CHAT_ID,
-      text: message,
-      parse_mode: 'HTML'
-    }),
-  });
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chat_id: GROUP_CHAT_ID,
+        text: message,
+        parse_mode: 'HTML'
+      }),
+      signal: AbortSignal.timeout(10000) // 10 second timeout
+    });
+  } catch (error) {
+    console.error('❌ Error sending Telegram message:', error);
+  }
 }
 
 async function checkForNewLinks(): Promise<void> {
@@ -69,16 +150,51 @@ async function checkForNewLinks(): Promise<void> {
     const newLinks = currentLinks.filter(link => !lastKnownLinks.includes(link));
     
     if (newLinks.length > 0) {
-      for (const newLink of newLinks) {
-        const message = `🚨 <b>NEW PHISHING LINK DETECTED!</b> 🚨\n\n` +
-                       `🔗Found new link on MetaMask phishing list:\n` +
-                       `<code>${newLink}</code>\n\n` +
-                       `Total links now: ${currentLinks.length}\n\n` +
-                       `📋 Check full list: <a href="${METAMASK_URL}">MetaMask Config</a>`;
-        
-        await sendTelegramMessage(message);
-        console.log(`🚨 New link detected: ${newLink}`);
+      console.log(`🚨 Found ${newLinks.length} new links, checking ChainAbuse...`);
+      
+      // Check all new links against ChainAbuse
+      const chainAbuseResults = await Promise.allSettled(
+        newLinks.map(async (link) => {
+          const result = await checkChainAbuseReports(link);
+          return { link, ...result };
+        })
+      );
+
+      // Calculate total reports from successful checks
+      let totalChainAbuseReports = 0;
+      const successfulResults = chainAbuseResults
+        .filter((result): result is PromiseFulfilledResult<{ link: string; totalReports: number; found: boolean }> => 
+          result.status === 'fulfilled')
+        .map(result => result.value);
+
+      totalChainAbuseReports = successfulResults.reduce((sum, result) => sum + result.totalReports, 0);
+
+      // Create single message for all new links (like original)
+      let message = `🚨 <b>NEW PHISHING LINK DETECTED!</b> 🚨\n\n`;
+      
+      if (newLinks.length === 1) {
+        message += `🔗 New link on MetaMask phishing list:\n<code>${newLinks[0]}</code>\n\n`;
+      } else {
+        message += `🔗 Found ${newLinks.length} new links on MetaMask phishing list:\n`;
+        newLinks.forEach(link => {
+          message += `<code>${link}</code>\n`;
+        });
+        message += `\n`;
       }
+      
+      message += `📊 Total MetaMask links now: ${currentLinks.length}\n\n`;
+      
+      // Add ChainAbuse summary
+      if (totalChainAbuseReports > 0) {
+        message += `🕵️ ChainAbuse: Found <b>${totalChainAbuseReports}</b> reports total\n\n`;
+      } else {
+        message += `🕵️ ChainAbuse: No reports found\n\n`;
+      }
+      
+      message += `📋 Check full MetaMask list: <a href="${METAMASK_URL}">MetaMask Config</a>`;
+      
+      await sendTelegramMessage(message);
+      console.log(`🚨 New links detected and message sent: ${newLinks.join(', ')}`);
       
       lastKnownLinks = currentLinks;
     } else {
